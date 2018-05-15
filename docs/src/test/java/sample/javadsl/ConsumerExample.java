@@ -29,8 +29,8 @@ import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
-import scala.concurrent.duration.Duration;
 
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Set;
 import java.util.Map;
@@ -38,6 +38,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 
 abstract class ConsumerExample {
   protected final ActorSystem system = ActorSystem.create("example");
@@ -251,7 +252,7 @@ class ConsumerToProducerWithBatchCommits2Example extends ConsumerExample {
 
       // #groupedWithin
       source
-        .groupedWithin(20, Duration.create(5, TimeUnit.SECONDS))
+        .groupedWithin(20, java.time.Duration.of(5, ChronoUnit.SECONDS))
         .map(group -> foldLeft(group))
         .mapAsync(3, c -> c.commitJavadsl())
       // #groupedWithin
@@ -388,4 +389,27 @@ class ConsumerMetricsExample extends ConsumerExample {
   }
 }
 
+class RestartingConsumer extends ConsumerExample {
+  public static void main(String[] args) { new RestartingConsumer().demo(); }
 
+  public void demo() {
+    //#restartSource
+    RestartSource.withBackoff(
+        java.time.Duration.of(3, ChronoUnit.SECONDS),
+        java.time.Duration.of(30, ChronoUnit.SECONDS),
+        0.2,
+            () ->
+                 Source.fromCompletionStage(
+                      Consumer
+                        .plainSource(consumerSettings, Subscriptions.topics("topic1"))
+                        .via(business())
+                        .watchTermination(
+                                 (control, completionStage) ->
+                                     completionStage.handle((res, ex) -> control.shutdown()).thenCompose(Function.identity())
+                         )
+                        .runWith(Sink.ignore(), materializer)
+                 )
+    );
+    //#restartSource
+  }
+}
