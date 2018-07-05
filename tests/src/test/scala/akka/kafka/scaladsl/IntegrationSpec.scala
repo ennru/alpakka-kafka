@@ -243,6 +243,45 @@ class IntegrationSpec extends SpecBase(kafkaPort = KafkaPorts.IntegrationSpec) w
       probe2.cancel()
     }
 
+    "consume and commit in grouped batches" in assertAllStagesStopped {
+      val topic1 = createTopic(1)
+      val group1 = createGroupId(1)
+
+      Await.result(produce(topic1, 1 to 100), remainingOrDefault)
+      val consumerSettings = consumerDefaults.withGroupId(group1)
+
+      def consumeAndBatchCommit(topic: String) =
+        Consumer
+          .committableSource(
+            consumerSettings,
+            Subscriptions.topics(topic)
+          )
+          .map { msg =>
+            msg.committableOffset
+          }
+          .groupedWithin(10, 1.seconds)
+          .map(CommittableOffsetBatch.apply)
+          .mapAsync(1)(_.commitScaladsl())
+          .toMat(TestSink.probe)(Keep.both)
+          .run()
+
+      val (control, probe) = consumeAndBatchCommit(topic1)
+
+      // Request one batch
+      probe.request(1).expectNextN(1)
+
+      probe.cancel()
+      Await.result(control.isShutdown, remainingOrDefault)
+
+      // Resume consumption
+      val (control2, probe2) = createProbe(consumerSettings, topic1)
+
+      val element = probe2.request(1).expectNext(60.seconds)
+
+      Assertions.assert(element.toInt > 10, "Should start after last element of first batch")
+      probe2.cancel()
+    }
+
     "connect consumer to producer and commit in batches" in {
       assertAllStagesStopped {
         val topic1 = createTopicName(1)
