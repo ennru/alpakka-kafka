@@ -5,35 +5,22 @@
 
 package akka.kafka.scaladsl
 
-import java.util
-import java.util.Collections
-import java.util.concurrent.ConcurrentLinkedQueue
-
-import akka.Done
-import akka.kafka.ConsumerMessage.CommittableOffsetBatch
-import akka.kafka.ProducerMessage.Message
+import akka.actor.{Actor, ActorRef}
 import akka.kafka._
 import akka.kafka.scaladsl.Consumer.DrainingControl
 import akka.kafka.test.Utils._
-import akka.pattern.ask
-import akka.stream.KillSwitches
-import akka.stream.SubstreamCancelStrategies.Drain
+import akka.stream.{KillSwitches, UniqueKillSwitch}
 import akka.stream.scaladsl.{Keep, Sink, Source}
-import akka.stream.testkit.scaladsl.TestSink
-import akka.testkit.TestProbe
-import akka.util.Timeout
 import net.manub.embeddedkafka.EmbeddedKafkaConfig
-import org.apache.kafka.clients.admin.NewTopic
 import org.apache.kafka.clients.consumer.ConsumerConfig
-import org.apache.kafka.clients.producer.{ProducerConfig, ProducerRecord}
+import org.apache.kafka.clients.producer.ProducerRecord
+import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.serialization._
-import org.apache.kafka.common.{Metric, MetricName, TopicPartition}
 import org.scalatest._
+import akka.kafka.KafkaConsumerActor
 
-import scala.collection.JavaConverters._
+import scala.concurrent.Future
 import scala.concurrent.duration._
-import scala.concurrent.{Await, Future}
-import scala.util.Success
 
 class SlowConsumptionSpec extends SpecBase(kafkaPort = KafkaPorts.SlowConsumptionSpec) with Inside {
 
@@ -57,55 +44,89 @@ class SlowConsumptionSpec extends SpecBase(kafkaPort = KafkaPorts.SlowConsumptio
    *
    * I did not find a way to inspect this discarding of fetched records from the outside, yet.
    */
+
+  val producerSettings = ProducerSettings(system, new StringSerializer, new IntegerSerializer)
+    .withBootstrapServers(bootstrapServers)
+
+  def producer(topic: String, partition: Int): (UniqueKillSwitch, Future[Integer]) =
+    Source
+      .fromIterator(() => Iterator.from(2))
+      .viaMat(KillSwitches.single)(Keep.right)
+      .map(
+        n => ProducerMessage.Message[String, Integer, Integer](new ProducerRecord(topic, partition, DefaultKey, n), n)
+      )
+      .via(Producer.flexiFlow(producerSettings))
+      .map(_.passThrough)
+      .toMat(Sink.last)(Keep.both)
+      .run()
+
+  def consumer(consumerActor: ActorRef,
+               topic: String,
+               partition: Int,
+               rate: FiniteDuration): Consumer.DrainingControl[Integer] =
+    Consumer
+      .plainExternalSource[String, Integer](consumerActor,
+                                            Subscriptions.assignment(new TopicPartition(topic, partition)))
+      .throttle(1, rate)
+      .map(record => {
+        val received = record.value()
+        log.info(s"Consumer of topic $topic received: $received")
+        received
+      })
+      .toMat(Sink.last)(Keep.both)
+      .mapMaterializedValue(DrainingControl.apply)
+      .run()
+
   "Reading slower than writing" must {
     "work" in assertAllStagesStopped {
+
+      val groupId = createGroupId(1)
       val topic1 = createTopic(1)
-      val group1 = createGroupId(1)
+      val topic2 = createTopic(2)
 
-      val producerSettings = ProducerSettings(system, new StringSerializer, new IntegerSerializer)
-        .withBootstrapServers(bootstrapServers)
-      val (producing, lastProduced) = Source
-        .fromIterator(() => Iterator.from(2))
-        .viaMat(KillSwitches.single)(Keep.right)
-        .map(
-          n =>
-            ProducerMessage.Message[String, Integer, Integer](new ProducerRecord(topic1, partition0, DefaultKey, n), n)
-        )
-        .via(Producer.flexiFlow(producerSettings))
-        .map(_.passThrough)
-        .toMat(Sink.last)(Keep.both)
-        .run()
+      val (producer1Switch, producer1LastProduced) = producer(topic1, partition0)
+      val (producer2Switch, producer2LastProduced) = producer(topic2, partition0)
 
-      val control = Consumer
-        .plainSource(
+      val sharedConsumerActor = system.actorOf(
+        KafkaConsumerActor.props(
           ConsumerSettings(system, new StringDeserializer, new IntegerDeserializer)
             .withBootstrapServers(bootstrapServers)
             .withProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
             .withWakeupTimeout(10.seconds)
             .withMaxWakeups(10)
-            .withGroupId(group1)
-            .withProperty("max.poll.records", "5"),
-          Subscriptions.topics(topic1)
+            .withGroupId(groupId)
+            .withProperty("max.poll.records", "5")
         )
-        .throttle(1, 1.seconds)
-        .map(_.value())
-        .toMat(Sink.last)(Keep.both)
-        .mapMaterializedValue(DrainingControl.apply)
-        .run()
+      )
 
-      sleep(5.seconds)
-      producing.shutdown()
-      val lastConsumed = control.drainAndShutdown()
-      val (produced, consumed) = Future
-        .sequence(Seq(lastProduced, lastConsumed))
+      val consumer1control = consumer(sharedConsumerActor, topic1, partition0, 1.second)
+      val consumer2control = consumer(sharedConsumerActor, topic2, partition0, 50.millisecond)
+
+      sleep(1.minute)
+      producer1Switch.shutdown()
+      producer2Switch.shutdown()
+
+      val consumer1LastConsumed = consumer1control.drainAndShutdown()
+      val consumer2LastConsumed = consumer2control.drainAndShutdown()
+
+      val (produced1, consumed1, produced2, consumed2) = Future
+        .sequence(Seq(producer1LastProduced, consumer1LastConsumed, producer2LastProduced, consumer2LastConsumed))
         .map {
-          case Seq(produced, consumed) =>
-            println(s"last element produced $produced")
-            println(s"last element consumed $consumed")
-            (produced, consumed)
+          case Seq(p1, c1, p2, c2) =>
+            println(s"P1: last element produced $p1")
+            println(s"C1: last element consumed $c1")
+            println(s"P2: last element produced $p2")
+            println(s"C2: last element consumed $c2")
+            (p1, c1, p2, c2)
         }
         .futureValue
-      produced should be > consumed
+
+      import akka.kafka.KafkaConsumerActor
+      sharedConsumerActor.tell(KafkaConsumerActor.stop, Actor.noSender)
+
+      produced1 should be > consumed1
+      produced2 should be > consumed2
+
     }
   }
 }

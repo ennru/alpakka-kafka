@@ -124,7 +124,7 @@ class KafkaConsumerActor[K, V](settings: ConsumerSettings[K, V]) extends Actor w
   val pollMsg = Poll(this, periodic = true)
   val delayedPollMsg = Poll(this, periodic = false)
   def pollTimeout() = settings.pollTimeout
-  def pollInterval() = settings.pollInterval
+  def pollInterval() = 10.minutes
 
   var currentPollTask: Cancellable = _
 
@@ -293,7 +293,7 @@ class KafkaConsumerActor[K, V](settings: ConsumerSettings[K, V]) extends Actor w
   }
 
   def scheduleFirstPollTask(): Unit =
-    if (currentPollTask == null) currentPollTask = schedulePollTask()
+    context.system.scheduler.scheduleOnce(50.millis, self, pollMsg)(context.dispatcher)
 
   def schedulePollTask(): Cancellable =
     context.system.scheduler.scheduleOnce(pollInterval(), self, pollMsg)(context.dispatcher)
