@@ -36,8 +36,7 @@ class RebalanceSpec extends SpecBase with TestcontainersKafkaLike with Inside {
       val topic1 = createTopic(topicSuffix, partitions = 2)
       val group1 = createGroupId(1)
       val consumerSettings = consumerDefaults
-      // This test FAILS with the default value as messages are enqueue in the stage
-        .withProperty(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, "1")
+        .withProperty(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, "500") // 500 is the default value
         .withGroupId(group1)
 
       awaitProduce(produce(topic1, 0 to count.toInt, partition1))
