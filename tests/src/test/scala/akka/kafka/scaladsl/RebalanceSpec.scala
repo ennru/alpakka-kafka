@@ -6,11 +6,9 @@
 package akka.kafka.scaladsl
 
 import java.util
-//import java.util.Locale
 import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 import java.util.concurrent.{TimeUnit, ConcurrentHashMap => CMap}
 
-//import akka.actor.Actor.Receive
 import akka.actor.{Actor, ActorLogging, DeadLetter, Props}
 import akka.kafka.ConsumerMessage.{CommittableMessage, CommittableOffset}
 import akka.kafka._
@@ -22,8 +20,7 @@ import akka.stream.testkit.scaladsl.TestSink
 import akka.stream.{KillSwitches, SharedKillSwitch}
 import akka.testkit.TestProbe
 import akka.{Done, NotUsed}
-import org.apache.kafka.clients.consumer.RoundRobinAssignor
-//import org.apache.kafka.common.requests.IsolationLevel
+import org.apache.kafka.clients.consumer.{OffsetAndMetadata, RoundRobinAssignor}
 
 import scala.concurrent.Promise
 import scala.util.Try
@@ -264,8 +261,9 @@ class RebalanceSpec extends SpecBase with TestcontainersKafkaLike with Inside {
       // BEGIN: vals and defs
       val topicCount = 10
       val partitionCount = 10
-      val perPartitionMessageCount = 1000 //1000
-      val businessSleepMs = 10L
+      val perPartitionMessageCount = 10 //1000
+      val businessSleepMs = 20
+      val maxAwait = 10.minute
       val pauseBetweenConsumers =
         FiniteDuration((perPartitionMessageCount * businessSleepMs) / 1000, TimeUnit.SECONDS)
       // in-memory message storage along with duplicate message count
@@ -324,7 +322,7 @@ class RebalanceSpec extends SpecBase with TestcontainersKafkaLike with Inside {
             topicPartitionFutureMap(topicPartition).complete(Try(Done))
           }
           // sleep to simulate expensive business logic
-          Thread.sleep(businessSleepMs)
+          Thread.sleep(Random.nextInt(businessSleepMs))
           message.committableOffset
         }
       }
@@ -336,8 +334,11 @@ class RebalanceSpec extends SpecBase with TestcontainersKafkaLike with Inside {
                                       sharedKillSwitch: SharedKillSwitch) = {
         val rebalanceListener = system.actorOf(Props(new RebalanceListenerActor(clientId, log)))
         Consumer
-          .committablePartitionedSource(consumerSettings.withClientId(clientId),
-                                        subscription.withRebalanceListener(rebalanceListener))
+          .committablePartitionedSource(
+            consumerSettings.withClientId(clientId),
+            subscription
+              .withRebalanceListener(rebalanceListener)
+          )
           .map {
             case (topicPartition, topicPartitionStream) =>
               log.debug(s"Consuming partitioned source clientId: $clientId, for tp: $topicPartition")
@@ -392,7 +393,6 @@ class RebalanceSpec extends SpecBase with TestcontainersKafkaLike with Inside {
         }
         .toSeq
         .flatten
-      Await.result(Future.sequence(producers), 4.minute)
       // END: publish a numeric series tagged messages across all topic-partitions
 
       // BEGIN: introduce first consumer1 with all topic-partitions assigned to it
@@ -461,13 +461,13 @@ class RebalanceSpec extends SpecBase with TestcontainersKafkaLike with Inside {
 
       // BEGIN: let producers publish all messages
       log.debug(s"BEGIN:8:finish producing all messages")
-      //Await.result(Future.sequence(producers), 4.minute)
+      Await.result(Future.sequence(producers), maxAwait)
       log.debug(s"END:8:finish producing all messages")
       // END: let producers publish all messages
 
       // BEGIN: let consumer2 consume all remaining messages
       log.debug(s"BEGIN:9:shutdown consumer $consumerClientId2")
-      Await.result(Future.sequence(topicPartitionFutureMap.values.map(_.future)), 4.minutes)
+      Await.result(Future.sequence(topicPartitionFutureMap.values.map(_.future)), maxAwait)
       log.debug(s"END:9:shutdown consumer $consumerClientId2")
       // END: let consumer2 consume all remaining messages
 
