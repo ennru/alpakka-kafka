@@ -57,7 +57,7 @@ import scala.util.control.NonFatal
     // Could be optimized to contain a Pattern as it used during reconciliation now, tho only in exceptional circumstances
     final case class SubscribePattern(pattern: String, rebalanceHandler: PartitionAssignmentHandler)
         extends SubscriptionRequest
-    final case object RegisterSubStage extends NoSerializationVerificationNeeded
+    final case class RegisterSubStage(tp: TopicPartition) extends NoSerializationVerificationNeeded
     final case class Seek(tps: Map[TopicPartition, Long]) extends NoSerializationVerificationNeeded
     final case class RequestMessages(requestId: Int, topics: Set[TopicPartition])
         extends NoSerializationVerificationNeeded
@@ -271,8 +271,11 @@ import scala.util.control.NonFatal
     case s: SubscriptionRequest =>
       handleSubscription(s)
 
-    case RegisterSubStage =>
+    case RegisterSubStage(tp) =>
       stageActors += sender()
+      consumer
+        .committed(Set(tp).asJava)
+        .forEach((tp, meta) => if (meta != null && meta.offset() > 0L) consumer.seek(tp, meta))
 
     case Seek(offsets) =>
       try {
